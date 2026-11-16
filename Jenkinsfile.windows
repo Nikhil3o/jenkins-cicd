@@ -1,0 +1,105 @@
+pipeline {
+    agent any
+
+    environment {
+        // Change to your Docker Hub username and repository name
+        DOCKER_HUB_USER         = 'nikhilchowdary'
+        IMAGE_NAME              = 'flask-k8s-app'
+        IMAGE_TAG               = "${env.BUILD_NUMBER}"
+        DOCKER_IMAGE            = "${DOCKER_HUB_USER}/${IMAGE_NAME}"
+
+        // Jenkins Credentials IDs configured in Jenkins -> Manage Credentials
+        DOCKER_HUB_CREDENTIALS  = 'dockerhub-credentials' // Username & Password credentials
+        KUBECONFIG_CREDENTIALS  = 'k8s-kubeconfig'         // Secret file credentials for kubeconfig
+    }
+
+    stages {
+        stage('Checkout SCM') {
+            steps {
+                echo '=== Stage 1: Checking out source code ==='
+                checkout scm
+            }
+        }
+
+        stage('Run Unit Tests') {
+            steps {
+                echo '=== Stage 2: Running Unit Tests ==='
+                bat '''
+                    python -m pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pytest test_app.py -v
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo "=== Stage 3: Building Docker Image: %DOCKER_IMAGE%:%IMAGE_TAG% ==="
+                bat """
+                    docker build -t %DOCKER_IMAGE%:%IMAGE_TAG% .
+                    docker tag %DOCKER_IMAGE%:%IMAGE_TAG% %DOCKER_IMAGE%:latest
+                """
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                echo '=== Stage 4: Pushing Docker Image to Registry ==='
+                withCredentials([usernamePassword(
+                    credentialsId: "${DOCKER_HUB_CREDENTIALS}",
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    bat """
+                        echo %DOCKER_PASS%| docker login -u %DOCKER_USER% --password-stdin
+                        docker push %DOCKER_IMAGE%:%IMAGE_TAG%
+                        docker push %DOCKER_IMAGE%:latest
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                echo '=== Stage 5: Deploying Application to Kubernetes Cluster ==='
+                withCredentials([file(credentialsId: "${KUBECONFIG_CREDENTIALS}", variable: 'KUBECONFIG')]) {
+                    powershell """
+                        # Substitute image placeholders with current build tag
+                        (Get-Content k8s/deployment.yaml) -replace 'REPLACE_IMAGE_NAME:REPLACE_IMAGE_TAG', "${DOCKER_IMAGE}:${IMAGE_TAG}" | Set-Content k8s/deployment.yaml
+
+                        # Apply Kubernetes manifests
+                        kubectl --kubeconfig=\$env:KUBECONFIG apply -f k8s/deployment.yaml
+                        kubectl --kubeconfig=\$env:KUBECONFIG apply -f k8s/service.yaml
+                    """
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                echo '=== Stage 6: Verifying Deployment Rollout ==='
+                withCredentials([file(credentialsId: "${KUBECONFIG_CREDENTIALS}", variable: 'KUBECONFIG')]) {
+                    bat """
+                        kubectl --kubeconfig=%KUBECONFIG% rollout status deployment/flask-k8s-deployment --timeout=120s
+                        kubectl --kubeconfig=%KUBECONFIG% get pods -l app=flask-k8s-app
+                        kubectl --kubeconfig=%KUBECONFIG% get svc flask-k8s-service
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '=== Cleaning up workspace ==='
+            cleanWs()
+        }
+        success {
+            echo "Pipeline succeeded! Application deployed successfully at version ${IMAGE_TAG}"
+        }
+        failure {
+            echo "Pipeline failed! Please inspect logs above for troubleshooting."
+        }
+    }
+}
